@@ -88,6 +88,16 @@ static FILTER_OBJECT MyObject = {
     NULL,		// No client reply
     diagnostic,
 };
+ 
+/**
+ * Options for Log output
+ */
+typedef enum 
+{
+  QLA_OPTS_DEFAULT  = 0x00, /* log.session */
+  QLA_OPTS_ONEFILE  = 0x01, /* log */
+  QLA_OPTS_DATABASE = 0x02  /* log.db1.db2.dbN */
+} log_option_t;
 
 /**
  * A instance structure, the assumption is that the option passed
@@ -106,6 +116,7 @@ typedef struct {
 	regex_t	re;		/* Compiled regex text */
 	char	*nomatch;	/* Optional text to match against for exclusion */
 	regex_t	nore;		/* Compiled regex nomatch text */
+	log_option_t logOptions;/* Options for log output */
 } QLA_INSTANCE;
 
 /**
@@ -122,6 +133,112 @@ typedef struct {
 	FILE		*fp;
 	int		active;
 } QLA_SESSION;
+ 
+/**
+ * Helper function: qla_logfile_postfix
+ *
+ * @return version string of the postfix
+ */
+
+char* qla_logfile_postfix(char *sessionDB, GWBUF *queue)
+{
+	int    i, n;
+	char** dbnames = NULL;
+	char*  postfix = NULL;
+	bool   addme;
+
+	if ( sessionDB && (strlen(sessionDB) > 0) )
+	{
+    	postfix = (char *) malloc(strlen(sessionDB) + 1);
+		/* TODO: Handle malloc error here, what return by default ? */
+    	strcpy(postfix, sessionDB);
+	}
+
+	n = 0;
+	dbnames = skygw_get_database_names(queue, &n);
+
+	if ( n > 0 ) 
+	{
+		for ( i = 0; i < n; i++ )
+		{
+			/* TODO: Not sure that dbnames[i] is actually name. Check more hashtable_fetch() */
+		    char* name = dbnames[i];
+
+			addme = false;
+			if ( sessionDB && (strlen(sessionDB) > 0) )
+			{
+				if ( strcmp(sessionDB, name) != 0 )
+				{
+					addme = true;
+				}
+			}
+			else
+			{
+				addme = true;
+			}
+
+			if ( addme )
+			{
+				size_t len = strlen(postfix);
+
+				postfix = realloc(postfix, len + strlen(name) + 2);
+				/* TODO: Handle realloc error here, what return by default ? */
+
+				if ( len > 0 )
+				{
+					strcat(postfix, ".");
+				}
+				strcat(postfix, name);
+			}
+
+			free(dbnames[i]);
+		}
+
+		free(dbnames);
+	}
+
+	return postfix;
+}
+
+/**
+ * Helper function: qla_logfile_update
+ *
+ * @return bool result 
+ */
+
+bool qla_logfile_update(char *filebase, char *postfix, QLA_SESSION *session)
+{
+	char *filenameNew = NULL;
+
+	filenameNew = (char *) malloc(strlen(filebase) + strlen(postfix) + 2);
+	/* TODO: Handle malloc error here, what return by default ? */
+
+	sprintf(filenameNew, "%s.%s", filebase, postfix);
+
+	if ( strcpy(filenameNew, session->filename) != 0 )
+	{
+		/* TODO: How session data change will affect downstream info ? */
+		if ( session->fp )
+		{
+			fclose(session->fp);
+		}
+
+		session->filename = realloc(session->filename, strlen(filenameNew) + 1);
+		/* TODO: Handle realloc error here, Handle this BIG PROBLEM ! */
+
+		/* TODO: How logs cleanup is happening ? 
+				'w' was doing it, but it's not suitable for this case. */
+		session->fp = fopen(session->filename, "a");
+		if ( session->fp == NULL )
+		{
+			/* TODO: Handle this BIG PROBLEM */
+		}
+	}
+	
+    free(filenameNew);
+
+	return true;
+}
 
 /**
  * Implementation of the mandatory version entry point
@@ -179,10 +296,13 @@ int		i;
 		}else{
 			my_instance->filebase = strdup("qla");
 		}
+
 		my_instance->source = NULL;
 		my_instance->userName = NULL;
 		my_instance->match = NULL;
 		my_instance->nomatch = NULL;
+		my_instance->logOptions = QLA_OPTS_DEFAULT;
+
 		if (params)
 		{
 			for (i = 0; params[i]; i++)
@@ -206,6 +326,23 @@ int		i;
 						my_instance->filebase = NULL;
 					}
 					my_instance->filebase = strdup(params[i]->value);
+				}
+				else if (!strcmp(params[i]->name, "log_option"))
+				{
+					if ( strcmp(params[i]->value, "onefile") == 0 )
+					{
+						my_instance->logOptions | = QLA_OPTS_ONEFILE;
+					}
+					else if ( strcmp(params[i]->value, "database") == 0 )
+					{
+						my_instance->logOptions | = QLA_OPTS_DATABASE;
+					}
+					else
+					{
+						LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
+						      "qlafilter: Unknown option for 'log_option':%s.",
+					              params[i]->value)));
+					}
 				}
 				else if (!filter_standard_parameter(params[i]->name))
 				{
@@ -301,9 +438,18 @@ char		*remote, *userName;
 		{
 			my_session->active = 0;
 		}
-		sprintf(my_session->filename, "%s.%d", 
-			my_instance->filebase,
-			my_instance->sessions);
+
+		if ( my_instance->logOptions & QLA_OPTS_ONEFILE )
+		{
+			strdup(my_session->filename, my_instance->filebase);
+		}
+		else
+		{
+			sprintf(my_session->filename, "%s.%d", 
+				my_instance->filebase,
+				my_instance->sessions);
+		}
+		
 		my_instance->sessions++;
 		
 		if (my_session->active)
@@ -418,12 +564,30 @@ struct timeval	tv;
 				(my_instance->nomatch == NULL ||
 					regexec(&my_instance->nore,ptr,0,NULL, 0) != 0))
 			{
+				if ( my_instance->logOptions & QLA_OPTS_DATABASE )
+				{
+					if ( ! qla_logfile_update(
+								qla_logfile_postfix(session->data->db, queue),
+								my_session) )
+					{
+						/* TODO: How to handle error situation in this case ? */
+					}
+				}
+
 				gettimeofday(&tv, NULL);
 				localtime_r(&tv.tv_sec, &t);
+
 				fprintf(my_session->fp,
 					"%02d:%02d:%02d.%-3d %d/%02d/%d, ",
 					t.tm_hour, t.tm_min, t.tm_sec, (int)(tv.tv_usec / 1000),
 					t.tm_mday, t.tm_mon + 1, 1900 + t.tm_year);
+
+				if ( my_instance->logOptions & QLA_OPTS_ONEFILE )
+				{
+					/* TODO: Define format of sessionId output, this done as example. */
+					fprintf(my_session->fp, "(%d) ", my_instance->sessions);
+				}
+
 				fprintf(my_session->fp,"%s\n",ptr);
 				
 			}
