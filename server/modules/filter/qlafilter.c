@@ -50,6 +50,10 @@
 #include <sys/time.h>
 #include <regex.h>
 #include <string.h>
+//
+#include <spinlock.h>
+#include <query_classifier.h>
+#include <mysql_client_server_protocol.h>
 
 /** Defined in log_manager.cc */
 extern int            lm_enabled_logfiles_bitmask;
@@ -90,14 +94,26 @@ static FILTER_OBJECT MyObject = {
 };
  
 /**
- * Options for Log output
+ * Options for QLA log types
  */
 typedef enum 
 {
-  QLA_OPTS_DEFAULT  = 0x00, /* log.session */
-  QLA_OPTS_ONEFILE  = 0x01, /* log */
-  QLA_OPTS_DATABASE = 0x02  /* log.db1.db2.dbN */
-} log_option_t;
+	QLALOG_OPTS_DEFAULT  = 0x00, /* log.session */
+	QLALOG_OPTS_ONEFILE  = 0x01, /* log */
+	QLALOG_OPTS_DATABASE = 0x02  /* log.db1.db2.dbN */
+} qlalog_option_t;
+
+/**
+ * The data structure for QLA log instance.
+ */
+typedef struct qlalog_instance
+{
+	SPINLOCK 				lock;		/* Logfile lock */
+	char					*filename;	/* Logfile name */
+	FILE					*fp;		/* File descriptor */
+	struct qlalog_instance	*prev;	/* Prev pointer (only needed for possible cleanup in case of log.sessionID */
+	struct qlalog_instance	*next;	/* Next pointer in the list of instances */
+} QLALOG_INSTANCE;
 
 /**
  * A instance structure, the assumption is that the option passed
@@ -116,7 +132,7 @@ typedef struct {
 	regex_t	re;		/* Compiled regex text */
 	char	*nomatch;	/* Optional text to match against for exclusion */
 	regex_t	nore;		/* Compiled regex nomatch text */
-	log_option_t logOptions;/* Options for log output */
+	qlalog_option_t logOptions;/* Options for log output */
 } QLA_INSTANCE;
 
 /**
@@ -132,15 +148,24 @@ typedef struct {
 	char		*filename;
 	FILE		*fp;
 	int		active;
+	SESSION		*session;
 } QLA_SESSION;
  
+
+/**
+ * Static variables for QLA log
+ */
+static SPINLOCK			 loglistlock;
+static QLALOG_INSTANCE	*loglist;
+
+
 /**
  * Helper function: qla_logfile_postfix
  *
  * @return version string of the postfix
  */
 
-char* qla_logfile_postfix(char *sessionDB, GWBUF *queue)
+char* qlalog_create_postfix(char *sessionDB, GWBUF *queue)
 {
 	int    i, n;
 	char** dbnames = NULL;
@@ -149,8 +174,17 @@ char* qla_logfile_postfix(char *sessionDB, GWBUF *queue)
 
 	if ( sessionDB && (strlen(sessionDB) > 0) )
 	{
-    	postfix = (char *) malloc(strlen(sessionDB) + 1);
-		/* TODO: Handle malloc error here, what return by default ? */
+    	if ( (postfix = (char *) malloc(strlen(sessionDB) + 1)) == NULL )
+		{
+			LOGIF(LE, (skygw_log_write(
+					LOGFILE_ERROR,
+					  "Error : Memory allocation for qla filter "
+					  "postfix failed due to %d, %s.",
+					  errno,
+					  strerror(errno))));
+			return NULL;
+		}
+
     	strcpy(postfix, sessionDB);
 	}
 
@@ -161,7 +195,8 @@ char* qla_logfile_postfix(char *sessionDB, GWBUF *queue)
 	{
 		for ( i = 0; i < n; i++ )
 		{
-			/* TODO: Not sure that dbnames[i] is actually name. Check more hashtable_fetch() */
+			/* TODO: Not sure that dbnames[i] is actually name. 
+					 Check more hashtable_fetch() */
 		    char* name = dbnames[i];
 
 			addme = false;
@@ -180,9 +215,23 @@ char* qla_logfile_postfix(char *sessionDB, GWBUF *queue)
 			if ( addme )
 			{
 				size_t len = strlen(postfix);
+				char  *tmp = NULL;
 
-				postfix = realloc(postfix, len + strlen(name) + 2);
-				/* TODO: Handle realloc error here, what return by default ? */
+				if ( (tmp = realloc(postfix, len + strlen(name) + 2)) == NULL )
+				{
+					LOGIF(LE, (skygw_log_write(
+							LOGFILE_ERROR,
+							  "Error : Memory allocation for qla filter "
+							  "postfix failed due to %d, %s.",
+							  errno,
+							  strerror(errno))));
+
+					free(postfix);
+
+					return NULL;
+				}
+
+				postfix = tmp;
 
 				if ( len > 0 )
 				{
@@ -201,37 +250,132 @@ char* qla_logfile_postfix(char *sessionDB, GWBUF *queue)
 }
 
 /**
- * Helper function: qla_logfile_update
+ * Function: qlalog_open_file
+ *
+ * @return 
+ */
+
+FILE* qlalog_open_file(char *filename)
+{
+	QLALOG_INSTANCE	*inst;
+
+	// try to find 
+	inst = loglist;
+
+	spinlock_acquire(&loglistlock);
+	while ( inst != NULL )
+	{
+		/* TODO: may be needed: spinlock_acquire(&inst->lock); */
+		if ( strcmp(inst->filename, filename) == 0 )
+		{
+			break;
+		}
+		/* TODO: may be needed: spinlock_release(&inst->lock); */
+
+		inst = inst->next;
+	}
+	spinlock_release(&loglistlock);
+
+	if ( inst != NULL )
+	{
+		return inst->fp;
+	}
+
+	// create new
+	if ( ( inst = malloc(sizeof(QLALOG_INSTANCE))) == NULL )
+	{
+		LOGIF(LE, (skygw_log_write(
+				LOGFILE_ERROR,
+				"Error : Memory allocation for qla filter "
+				"log instance failed due to %d, %s.",
+				errno,
+				strerror(errno))));
+		return NULL;
+	}
+
+	spinlock_init(&inst->lock);
+	inst->filename = strdup(filename);
+	inst->fp       = NULL;
+	inst->prev     = NULL;
+	inst->next     = NULL;
+
+	// open
+	inst->fp = fopen(inst->filename, "w");
+			
+	if ( inst->fp == NULL )
+	{
+		LOGIF(LE, (skygw_log_write(
+				LOGFILE_ERROR,
+				"Error : Opening output file %s for qla "
+				"filter failed due to %d, %s",
+				inst->filename,
+				errno,
+				strerror(errno))));
+
+		free(inst->filename);
+		free(inst);
+
+		return NULL;
+	}
+
+	// add new
+	spinlock_acquire(&loglistlock);
+	inst->next    = loglist;
+	loglist->prev = inst;
+	loglist       = inst;
+	spinlock_release(&loglistlock);
+
+	return inst->fp;
+}
+
+/**
+ * Function: qlalog_update_session_file
  *
  * @return bool result 
  */
 
-bool qla_logfile_update(char *filebase, char *postfix, QLA_SESSION *session)
+bool qlalog_update_session_file(char *filebase, char *postfix, QLA_SESSION *session)
 {
 	char *filenameNew = NULL;
 
 	filenameNew = (char *) malloc(strlen(filebase) + strlen(postfix) + 2);
-	/* TODO: Handle malloc error here, what return by default ? */
+	if ( filenameNew == NULL )
+	{
+		LOGIF(LE, (skygw_log_write(
+				LOGFILE_ERROR,
+			      "Error : Memory allocation for qla filter "
+			      "file name failed due to %d, %s.",
+			      errno,
+			      strerror(errno))));
+		return false;
+	}
 
 	sprintf(filenameNew, "%s.%s", filebase, postfix);
 
-	if ( strcpy(filenameNew, session->filename) != 0 )
+	if ( strcmp(filenameNew, session->filename) == 0 )
 	{
-		/* TODO: How session data change will affect downstream info ? */
-		if ( session->fp )
-		{
-			fclose(session->fp);
-		}
+		free(filenameNew);
+		return true;
+	}
 
-		session->filename = realloc(session->filename, strlen(filenameNew) + 1);
-		/* TODO: Handle realloc error here, Handle this BIG PROBLEM ! */
+	// update session filename & descriptor
+	/* TODO: How session data change will affect downstream info ? Can be do it ? */
+	session->fp = NULL;
+	free(session->filename);
+	session->filename = strdup(filenameNew);
 
-		/* TODO: How logs cleanup is happening ? 
-				'w' was doing it, but it's not suitable for this case. */
-		session->fp = fopen(session->filename, "a");
+	if ( session->active )
+	{
+		session->fp = qlalog_open_file(session->filename);
+
 		if ( session->fp == NULL )
 		{
-			/* TODO: Handle this BIG PROBLEM */
+			free(session->filename);
+			session->filename = NULL;
+
+			free(filenameNew);
+
+			return false;
 		}
 	}
 	
@@ -258,6 +402,8 @@ version()
 void
 ModuleInit()
 {
+	spinlock_init(&loglistlock);
+	loglist = NULL;
 }
 
 /**
@@ -301,7 +447,7 @@ int		i;
 		my_instance->userName = NULL;
 		my_instance->match = NULL;
 		my_instance->nomatch = NULL;
-		my_instance->logOptions = QLA_OPTS_DEFAULT;
+		my_instance->logOptions = QLALOG_OPTS_DEFAULT;
 
 		if (params)
 		{
@@ -331,17 +477,18 @@ int		i;
 				{
 					if ( strcmp(params[i]->value, "onefile") == 0 )
 					{
-						my_instance->logOptions | = QLA_OPTS_ONEFILE;
+						my_instance->logOptions |= QLALOG_OPTS_ONEFILE;
 					}
 					else if ( strcmp(params[i]->value, "database") == 0 )
 					{
-						my_instance->logOptions | = QLA_OPTS_DATABASE;
+						my_instance->logOptions |= QLALOG_OPTS_DATABASE;
 					}
 					else
 					{
 						LOGIF(LE, (skygw_log_write_flush(LOGFILE_ERROR,
-						      "qlafilter: Unknown option for 'log_option':%s.",
-					              params[i]->value)));
+								"qlafilter: Unknown option for 'log_option':%s.",
+								params[i]->value)));
+						my_instance->logOptions = QLALOG_OPTS_DEFAULT;
 					}
 				}
 				else if (!filter_standard_parameter(params[i]->name))
@@ -439,31 +586,31 @@ char		*remote, *userName;
 			my_session->active = 0;
 		}
 
-		if ( my_instance->logOptions & QLA_OPTS_ONEFILE )
+		if ( my_instance->logOptions & QLALOG_OPTS_DEFAULT )
 		{
-			strdup(my_session->filename, my_instance->filebase);
-		}
-		else
-		{
-			sprintf(my_session->filename, "%s.%d", 
+			sprintf(my_session->filename, 
+				"%s.%d", 
 				my_instance->filebase,
 				my_instance->sessions);
+		}
+		else if ( my_instance->logOptions & QLALOG_OPTS_ONEFILE )
+		{
+			strcpy(my_session->filename, my_instance->filebase);
+		}
+		else if ( my_instance->logOptions & QLALOG_OPTS_DATABASE )
+		{
+			/* TODO: NB: for now use basename for database option */
+			strcpy(my_session->filename, my_instance->filebase);
 		}
 		
 		my_instance->sessions++;
 		
 		if (my_session->active)
 		{
-			my_session->fp = fopen(my_session->filename, "w");
-			
+			my_session->fp = qlalog_open_file(my_session->filename);
+
 			if (my_session->fp == NULL)
 			{
-				LOGIF(LE, (skygw_log_write(
-					LOGFILE_ERROR,
-					"Error : Opening output file for qla "
-					"fileter failed due to %d, %s",
-					errno,
-					strerror(errno))));
 				free(my_session->filename);
 				free(my_session);
 				my_session = NULL;
@@ -479,6 +626,9 @@ char		*remote, *userName;
 			errno,
 			strerror(errno))));
 	}
+
+	my_session->session = session;
+
 	return my_session;
 }
 
@@ -494,9 +644,16 @@ static	void
 closeSession(FILTER *instance, void *session)
 {
 QLA_SESSION	*my_session = (QLA_SESSION *)session;
+QLA_INSTANCE	*my_instance = (QLA_INSTANCE *)instance;
 
-	if (my_session->active && my_session->fp)
-		fclose(my_session->fp);
+	if ( my_instance->logOptions & QLALOG_OPTS_DEFAULT )
+	{
+		if (my_session->active && my_session->fp)
+		{
+			/* TODO: add cleanup of logfilelist ! */
+			fclose(my_session->fp);
+		}
+	}
 }
 
 /**
@@ -564,32 +721,55 @@ struct timeval	tv;
 				(my_instance->nomatch == NULL ||
 					regexec(&my_instance->nore,ptr,0,NULL, 0) != 0))
 			{
-				if ( my_instance->logOptions & QLA_OPTS_DATABASE )
+				bool skipit   = false;
+				char *postfix = NULL;
+
+				if ( my_instance->logOptions & QLALOG_OPTS_DATABASE )
 				{
-					if ( ! qla_logfile_update(
-								qla_logfile_postfix(session->data->db, queue),
-								my_session) )
+					MYSQL_session* mysql_session = (MYSQL_session*)my_session->session->data;
+					if ( ( postfix = qlalog_create_postfix(
+										mysql_session->db, 
+										queue) ) == NULL )
 					{
-						/* TODO: How to handle error situation in this case ? */
+						skipit = true;
+					}
+					else
+					{
+						if ( ! qlalog_update_session_file(
+									my_instance->filebase,
+									postfix,
+									my_session) )
+						{
+							skipit = true;
+						}
+
+						free(postfix);
 					}
 				}
 
-				gettimeofday(&tv, NULL);
-				localtime_r(&tv.tv_sec, &t);
-
-				fprintf(my_session->fp,
-					"%02d:%02d:%02d.%-3d %d/%02d/%d, ",
-					t.tm_hour, t.tm_min, t.tm_sec, (int)(tv.tv_usec / 1000),
-					t.tm_mday, t.tm_mon + 1, 1900 + t.tm_year);
-
-				if ( my_instance->logOptions & QLA_OPTS_ONEFILE )
+				if ( skipit )
 				{
-					/* TODO: Define format of sessionId output, this done as example. */
-					fprintf(my_session->fp, "(%d) ", my_instance->sessions);
+					/* TODO: How to handle error situation in this case ? */
 				}
+				else
+				{
+					gettimeofday(&tv, NULL);
+					localtime_r(&tv.tv_sec, &t);
 
-				fprintf(my_session->fp,"%s\n",ptr);
-				
+					fprintf(my_session->fp,
+						"%02d:%02d:%02d.%-3d %d/%02d/%d, ",
+						t.tm_hour, t.tm_min, t.tm_sec, (int)(tv.tv_usec / 1000),
+						t.tm_mday, t.tm_mon + 1, 1900 + t.tm_year);
+
+					if ( my_instance->logOptions & QLALOG_OPTS_ONEFILE )
+					{
+						/* TODO: Define format of sessionId output, this done as example. */
+						/* TODO: Should we add the same in case of DATABASE /*/
+						fprintf(my_session->fp, "(%d) ", my_instance->sessions);
+					}
+
+					fprintf(my_session->fp,"%s\n",ptr);
+				}
 			}
 			free(ptr);
 		}
