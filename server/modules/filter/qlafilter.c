@@ -145,9 +145,9 @@ typedef struct {
  */
 typedef struct {
 	DOWNSTREAM	down;
-	char		*filename;
-	FILE		*fp;
+	char		*filename;	/* TODO: can became obsolete */
 	int		active;
+	QLALOG_INSTANCE *logfile;
 	SESSION		*session;
 } QLA_SESSION;
  
@@ -255,7 +255,7 @@ char* qlalog_create_postfix(char *sessionDB, GWBUF *queue)
  * @return 
  */
 
-FILE* qlalog_open_file(char *filename)
+QLALOG_INSTANCE* qlalog_open_file(char *filename)
 {
 	QLALOG_INSTANCE	*inst;
 
@@ -278,7 +278,7 @@ FILE* qlalog_open_file(char *filename)
 
 	if ( inst != NULL )
 	{
-		return inst->fp;
+		return inst;
 	}
 
 	// create new
@@ -297,7 +297,7 @@ FILE* qlalog_open_file(char *filename)
 	inst->filename = strdup(filename);
 	inst->fp       = NULL;
 	inst->prev     = NULL;
-	inst->next     = NULL;
+    inst->next     = NULL;
 
 	// open
 	inst->fp = fopen(inst->filename, "w");
@@ -325,7 +325,7 @@ FILE* qlalog_open_file(char *filename)
 	loglist       = inst;
 	spinlock_release(&loglistlock);
 
-	return inst->fp;
+	return inst;
 }
 
 /**
@@ -360,15 +360,15 @@ bool qlalog_update_session_file(char *filebase, char *postfix, QLA_SESSION *sess
 
 	// update session filename & descriptor
 	/* TODO: How session data change will affect downstream info ? Can be do it ? */
-	session->fp = NULL;
+	session->logfile = NULL;
 	free(session->filename);
 	session->filename = strdup(filenameNew);
 
 	if ( session->active )
 	{
-		session->fp = qlalog_open_file(session->filename);
+		session->logfile = qlalog_open_file(session->filename);
 
-		if ( session->fp == NULL )
+		if ( session->logfile == NULL )
 		{
 			free(session->filename);
 			session->filename = NULL;
@@ -569,6 +569,7 @@ char		*remote, *userName;
 			free(my_session);
 			return NULL;
 		}
+		my_session->logfile = NULL;
 		my_session->active = 1;
 		
 		if (my_instance->source 
@@ -607,9 +608,9 @@ char		*remote, *userName;
 		
 		if (my_session->active)
 		{
-			my_session->fp = qlalog_open_file(my_session->filename);
+			my_session->logfile = qlalog_open_file(my_session->filename);
 
-			if (my_session->fp == NULL)
+			if (my_session->logfile == NULL)
 			{
 				free(my_session->filename);
 				free(my_session);
@@ -648,10 +649,12 @@ QLA_INSTANCE	*my_instance = (QLA_INSTANCE *)instance;
 
 	if ( my_instance->logOptions & QLALOG_OPTS_DEFAULT )
 	{
-		if (my_session->active && my_session->fp)
+		if (my_session->active && my_session->logfile)
 		{
 			/* TODO: add cleanup of logfilelist ! */
-			fclose(my_session->fp);
+			spinlock_acquire(&my_session->logfile->lock);
+			fclose(my_session->logfile->fp);
+			spinlock_release(&my_session->logfile->lock);
 		}
 	}
 }
@@ -756,19 +759,30 @@ struct timeval	tv;
 					gettimeofday(&tv, NULL);
 					localtime_r(&tv.tv_sec, &t);
 
-					fprintf(my_session->fp,
-						"%02d:%02d:%02d.%-3d %d/%02d/%d, ",
-						t.tm_hour, t.tm_min, t.tm_sec, (int)(tv.tv_usec / 1000),
-						t.tm_mday, t.tm_mon + 1, 1900 + t.tm_year);
-
-					if ( my_instance->logOptions & QLALOG_OPTS_ONEFILE )
+					if ( my_session->logfile && my_session->logfile->fp )
 					{
-						/* TODO: Define format of sessionId output, this done as example. */
-						/* TODO: Should we add the same in case of DATABASE /*/
-						fprintf(my_session->fp, "(%d) ", my_instance->sessions);
-					}
+						spinlock_acquire(&my_session->logfile->lock);
 
-					fprintf(my_session->fp,"%s\n",ptr);
+						fprintf(my_session->logfile->fp,
+							"%02d:%02d:%02d.%-3d %d/%02d/%d, ",
+							t.tm_hour, t.tm_min, t.tm_sec, (int)(tv.tv_usec / 1000),
+							t.tm_mday, t.tm_mon + 1, 1900 + t.tm_year);
+
+						if ( my_instance->logOptions & QLALOG_OPTS_ONEFILE )
+						{
+							/* TODO: Define format of sessionId output, this is example. */
+							/* TODO: Should we add the same in case of DATABASE /*/
+							fprintf(my_session->logfile->fp, "(%d) ", my_instance->sessions);
+						}
+
+						fprintf(my_session->logfile->fp,"%s\n",ptr);
+
+						spinlock_release(&my_session->logfile->lock);
+					}
+					else
+					{
+						/* TODO: How to handle error situation in this case ? */
+					}
 				}
 			}
 			free(ptr);
